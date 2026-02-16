@@ -1,0 +1,8 @@
+/.DS_Store
+/venv
+/archive
+/temp
+/backtest_results
+/Practice
+/FX_data
+/__pycache__
