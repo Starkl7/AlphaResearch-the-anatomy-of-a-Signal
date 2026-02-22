@@ -3,8 +3,9 @@ import numpy as np
 import pandas as pd
 from sklearn.linear_model import LinearRegression
 import matplotlib.pyplot as plt
-
+import tqdm
 import helper_functions as fx
+import pickle
 
 def load_resampled_returns(pair, interval, file_path):
     df = pd.read_parquet(os.path.join(file_path, f"{pair}/", f"{pair}_resampled_{interval}_returns.parquet"))
@@ -588,3 +589,82 @@ def backtest_pairs_main(pair1, pair2, interval, hedge_ratio_baseline, half_life_
     fig = plot_results(pair1, pair2, signals, returns)
     
     return signals, returns, trades, fig
+
+def get_half_lives(fx_pairs, intervals, file_path):
+    errors = {}
+    half_lives = {}
+    total_iterations = len(fx_pairs) * (len(fx_pairs) - 1) * len(intervals)
+
+    with tqdm(total=total_iterations, desc="Testing Mean Reversion") as pbar:
+        for a in fx_pairs:
+            for b in fx_pairs:
+                if a != b:
+                    for interval in intervals:
+                        temp1, temp2 = fx.test_half_life_mean_reversion(a, b, interval, file_path, 'Close', '2012-12-31')
+                        if temp1 is not None and temp2 is not None:
+                            errors[f"{a}_{b}_{interval}"] = (temp1, temp2)
+                            half_lives[f"{a}_{b}_{interval}"] = 0
+                        elif temp1 is not None and temp2 is None:
+                            half_lives[f"{a}_{b}_{interval}"] = temp1
+                        pbar.update(1)
+                        pbar.set_postfix({"Current Pair": f"{a}_{b}", "Interval": interval})
+
+    return half_lives, errors
+
+def filter_half_lives(half_lives, min_half_life=5, max_half_life=70):
+    print(f"Original list of half-lives by combinations of pairs and intervals: {len(list(half_lives.keys()))}")
+    half_lives_new = {k: v for k, v in half_lives.items() if v > min_half_life and v < max_half_life}
+    print(f"Filtered list of half-lives by combinations of pairs and intervals: {len(list(half_lives_new.keys()))}")
+    return half_lives_new
+
+def convert_to_half_lives_dataframe(half_lives_new, intervals):
+    pairs_set = set()
+    for key in half_lives_new.keys():
+        parts = key.split('_')
+        if len(parts) >= 3:
+            pair1 = parts[0]
+            pair2 = parts[1]
+            pairs_set.add(pair1)
+            pairs_set.add(pair2)
+
+    pairs = sorted(pairs_set)
+    half_lives_df = pd.DataFrame(index=pairs, columns=pairs, dtype=object)
+
+    for pair1 in pairs:
+        for pair2 in pairs:
+            values = []
+            for interval in intervals:
+                key = f"{pair1}_{pair2}_{interval}"
+                values.append(float(half_lives_new.get(key, 0)))
+            half_lives_df.loc[pair1, pair2] = values
+    
+    return half_lives_df
+
+def wrap_baseline_metrics(half_lives_df, pairs, intervals, file_path):
+    baseline_hedge_ratios = pd.DataFrame(0, index=half_lives_df.index, columns=half_lives_df.columns, dtype=object)
+    baseline_half_lives = pd.DataFrame(0, index=half_lives_df.index, columns=half_lives_df.columns, dtype=object)
+    baseline_hedge_data = {}
+    for pair1 in pairs:
+        for pair2 in pairs:
+            half_lives_df_values = half_lives_df.loc[pair1, pair2]
+            hr_list = []
+            hl_list = []
+            for interval in intervals:
+                interval_idx = intervals.index(interval)
+                if half_lives_df_values[interval_idx] != 0:
+                    baseline_hr, baseline_hl = fx.get_baseline_hedge_ratio_and_half_life(pair1, pair2, interval, file_path, 'Close', '2012-12-31')
+                    hr_list.append(baseline_hr)
+                    hl_list.append(baseline_hl)
+                else:
+                    print("Skipping...")
+                    hr_list.append(0)
+                    hl_list.append(0)
+            if hr_list and hl_list:
+                baseline_hedge_ratios.loc[pair1, pair2] = hr_list
+                baseline_half_lives.loc[pair1, pair2] = hl_list
+    with open('./temp/baseline_hedge_ratios.pkl', 'wb') as f:
+        pickle.dump(baseline_hedge_ratios, f)
+    print("Baseline hedge ratios saved to ./temp/baseline_hedge_ratios.pkl")
+    with open('./temp/baseline_half_lives.pkl', 'wb') as f:
+        pickle.dump(baseline_half_lives, f)
+    print("Baseline half-lives saved to ./temp/baseline_half_lives.pkl")

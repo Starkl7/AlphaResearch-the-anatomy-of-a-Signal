@@ -1,3 +1,4 @@
+from joblib import Parallel, delayed
 import zipfile
 import pandas as pd
 import os
@@ -10,6 +11,9 @@ from statsmodels.tsa.stattools import adfuller, kpss, coint, grangercausalitytes
 from statsmodels.tsa.api import VAR
 from statsmodels.tsa.seasonal import seasonal_decompose
 from statsmodels.graphics.tsaplots import plot_acf, plot_pacf
+from statsmodels.tsa.vector_ar.vecm import coint_johansen
+import trade_functions as tf
+
 
 # file_path = '/Volumes/SEAGATE/FX_data/FX_histdata/'
 # fx_pairs = ["EURUSD", "EURGBP", "USDJPY", "GBPUSD", "USDCHF", "USDCAD", "AUDUSD", "NZDUSD", "EURJPY", "GBPJPY", "EURCHF", "AUDJPY", "EURAUD", "GBPAUD"]
@@ -130,35 +134,6 @@ def plot_returns_distribution(fx_pairs, intervals, file_path):
             plt.grid()
             plt.tight_layout()
             plt.show()
-
-            # returns_all = df_audusd_ffill['ret']
-            # mask_orig = df_audusd_ffill['flag'] == 1
-            # returns_orig = df_audusd_ffill.loc[mask_orig, 'ret']
-
-            # fig, axes = plt.subplots(1, 2, figsize=(14, 4))
-            # sns.histplot(returns_all, bins=200, kde=True, ax=axes[0], color='C0')
-            # axes[0].set_title('All returns (zeros included)')
-            # axes[0].set_xlabel('ret')
-
-            # # clip extreme tails for clearer view
-            # qlo, qhi = returns_orig.quantile([0.001, 0.999]).values
-            # sns.histplot(returns_orig.clip(qlo, qhi), bins=200, kde=True, ax=axes[1], color='C1')
-            # axes[1].set_title('Returns where flag == 1 (clipped 0.1-99.9%)')
-            # axes[1].set_xlabel('ret')
-
-            # plt.tight_layout()
-            # plt.show()
-
-# def rolling_correlation(main_pair, main_interval, col, window, fx_pairs, intervals, file_path):
-#     main_pair = pd.read_parquet(os.path.join(file_path, f"{main_pair}/", f"{main_pair}_resampled_{main_interval}_returns.parquet"))
-#     intervals = [i for i in intervals if i >= main_interval]
-#     for ref_interval in intervals:
-#         print(f"Calculating rolling correlation for {ref_interval} interval")
-#         for pair in fx_pairs:
-#             ref_pair = pd.read_parquet(os.path.join(file_path, f"{pair}/", f"{pair}_resampled_{ref_interval}_returns.parquet"))
-#             main_pair[f'RollingCorr_{pair}_{window}_{ref_interval}'] = main_pair[col].rolling(window=window).corr(ref_pair[col])
-    
-#     return main_pair[[f'RollingCorr_{pair}_{window}_{ref_interval}' for pair in fx_pairs for ref_interval in intervals]]
             
 def calc_returns_gap(main_pair, interval, fx_pairs, file_path):
     returns_gap = pd.DataFrame()
@@ -191,32 +166,6 @@ def kpss_test(series, verbosity=0):
         print('Critical Values:')
         for key, value in critical_values.items():
             print(f'   {key} : {value}')
-
-def rolling_ols_coeff(feature_df, target_df, train_period):
-    coefficients = []
-    dates = []
-    # feature_df = feature_df.loc[start_date:]
-    # target_df = target_df.loc[start_date:]
-
-    for i in range(train_period, len(feature_df)-train_period+1):
-        # Expanding window: train on all data from start to current point
-        log_returns1 = feature_df.iloc[i: i+train_period]
-        log_returns2 = target_df.iloc[i: i+train_period]
-
-        if len(log_returns1) != len(log_returns2):
-            continue
-        
-        X = log_returns1.values.reshape(-1, 1)
-        y = log_returns2.values
-        
-        model = LinearRegression()
-        model.fit(X, y)
-        
-        coefficients.append(model.coef_[0])
-        dates.append(feature_df.index[i+train_period-1])
-
-    coef_df = pd.DataFrame(coefficients, index=dates, columns=[feature_df.name + '_coef'])
-    return coef_df
 
 def forward_fill_returns(df, freq):
     full_range = pd.date_range(start=df.index.min(), end=df.index.max(), freq=freq)
@@ -308,16 +257,22 @@ def forward_fill_df(df):
     df_filled = df_filled.fillna(method='ffill')
     return df_filled
 
-def common_duration(df1, df2, period_in_days=None):
+def common_duration(df1, df2, start_date=None, period_in_Timedelta=None, max_period_end=None):
     df1.replace([np.inf, -np.inf], np.nan, inplace=True)
     df2.replace([np.inf, -np.inf], np.nan, inplace=True)
     df1 = df1.dropna()
     df2 = df2.dropna()
     start = max(df1.index.min(), df2.index.min())
-    if period_in_days is not None:
-        end = start + pd.Timedelta(days=period_in_days)
+    if start_date is not None:
+        start = pd.to_datetime(start_date)
+
+    if period_in_Timedelta is not None:
+        end = start + period_in_Timedelta
+    if max_period_end is not None:
+        end = min(end, max_period_end)
     else:
         end = min(df1.index.max(), df2.index.max())
+
     interval1 = get_dynamic_freq(df1.index)
     interval2 = get_dynamic_freq(df2.index)
     if interval1 != interval2:
@@ -441,3 +396,130 @@ def get_baseline_hedge_ratio_and_half_life(pair1, pair2, interval, file_path, fe
     
     half_life = -np.log(2) / get_beta_lr(spread_lag, spread_ret)
     return hedge_ratio, half_life
+
+def parallel_process_window(pair1_aligned, pair2_aligned, window_idx, window_start, window_end, autolag='AIC'):
+        try:
+            pair1_window = pair1_aligned.loc[window_start:window_end]
+            pair2_window = pair2_aligned.loc[window_start:window_end]
+            t_stat, pval, crit_vals = coint(pair1_window['Close'], pair2_window['Close'], autolag=autolag)
+            return (window_end, pval)
+        except Exception as e:
+            print(f"Error at window {window_idx} ending {window_end}: {e}")
+            return (window_end, np.nan)
+        
+def get_rolling_granger_pvalues(pair1, pair2, autolag='AIC', period=pd.Timedelta(days=252*5), n_jobs=-1):
+    pair1_aligned, pair2_aligned = common_duration(pair1, pair2, period_in_Timedelta=None)
+    
+    start_date = pair1_aligned.index.min()
+    end_date = pair1_aligned.index.max()
+    freq = get_dynamic_freq(pair1_aligned.index)
+    
+    windows = []
+    current_start = start_date
+    window_end = current_start + period
+    
+    while window_end <= end_date:
+        windows.append((current_start, window_end))
+        current_start += pd.Timedelta(days=21)
+        window_end = current_start + period
+    
+    print(f"Running rolling cointegration test from {start_date} to {end_date}...")
+    print(f"Window size: {period}")
+    print(f"Total windows to process: {len(windows)}")
+    # print("Error incoming....")
+    results = Parallel(n_jobs=n_jobs, verbose=1)(
+        delayed(parallel_process_window)(pair1_aligned, pair2_aligned, idx, start, end) 
+        for idx, (start, end) in enumerate(windows)
+    )
+
+    results.sort(key=lambda x: x[0])
+    dates = [r[0] for r in results]
+    pvalues = [r[1] for r in results]
+    print(f"Completed {len(results)} windows")
+    
+    pvalue_series = pd.Series(pvalues, index=dates, name='pval')
+    return pvalue_series
+
+# Johansen would be too computationally expensive. Lets work on it some other time.
+# def optimal_johansen_params(df, maxlags=10):
+#     df_diff = df.diff().dropna()
+#     model = VAR(df_diff)
+#     lag_order = model.select_order(maxlags=maxlags)
+    
+#     print("Lag order selection:")
+#     print(lag_order.summary())
+    
+#     # Use AIC (tends to select more lags) or BIC (more conservative)
+#     k_ar_diff = lag_order.aic
+    
+#     # Run Johansen with selected lag
+#     result = coint_johansen(df, det_order=0, k_ar_diff=k_ar_diff)
+    
+#     return result, k_ar_diff
+
+    # result, best_lag = optimal_johansen_params(df)
+
+# def wrap_optimal_johansen_params(pair1, pair2, interval, file_path, feature='Close', split_date='2010-12-31'):
+#     print(f"Running optimal Johansen params for {pair1} and {pair2} at interval {interval}")
+#     pair1_full = pd.read_parquet(os.path.join(file_path, f"{pair1}/", f"{pair1}_resampled_{interval}_returns.parquet"))
+#     pair2_full = pd.read_parquet(os.path.join(file_path, f"{pair2}/", f"{pair2}_resampled_{interval}_returns.parquet"))
+    
+#     pair1_full_new, pair2_full_new = common_duration(pair1_full, pair2_full)
+#     pair1_train, _ = get_train_test(pair1_full_new, split_date)
+#     pair2_train, _ = get_train_test(pair2_full_new, split_date)
+
+#     df = pd.DataFrame({
+#         f'{pair1}_{feature}': pair1_train[feature],
+#         f'{pairs}_{feature}': pair2_train[feature]
+#     }).dropna()
+
+#     result, best_lag = optimal_johansen_params(df)
+#     print(f"Optimal lag for Johansen test: {best_lag}")
+#     print("Johansen test results:")
+#     print(result.summary())
+#     return result
+# def get_rolling_johansen_values()
+def get_maxlag_coint(interval):
+    maxlag_config = {
+        '1T': 200,
+        '5T': 100,
+        '10T': 100,
+        '15T': 80,
+        '30T': 60,
+        '1H': 50,
+        '3H': 40,
+        '6H': 30,
+        '1D': 20
+    }
+    return maxlag_config.get(interval, 20)
+
+def parallel_granger_coint(pair1, pair2, interval, end_td, end_max, file_path):
+    try:
+        pair1_full = tf.load_resampled_returns(pair1, interval, file_path)
+        pair2_full = tf.load_resampled_returns(pair2, interval, file_path)
+        pair1_aligned, pair2_aligned = common_duration(pair1_full, pair2_full, start_date=None, period_in_Timedelta=end_td, max_period_end=end_max)
+        corr_precheck = pair1_aligned['Close'].pct_change().dropna().corr(pair2_aligned['Close'].pct_change().dropna())
+        if abs(corr_precheck) < 0.1:
+            print(f"Skipping {pair1} and {pair2} at interval {interval} due to low correlation ({corr_precheck:.2f})")
+            return ((pair1, pair2), np.nan)
+        t_stat, pval, crit_vals = coint(pair1_aligned['Close'], pair2_aligned['Close'], maxlag=get_maxlag_coint(interval), autolag='AIC')
+        return ((pair1, pair2), pval)
+    except Exception as e:
+        print(f"Error processing {pair1} and {pair2} at interval {interval}: {e}")
+        return ((pair1, pair2), np.nan)
+
+def initial_granger_cointegration(fx_pairs, intervals, file_path, end_td=pd.Timedelta(days=252*5), end_max=pd.Timestamp('2010-12-31'), n_jobs=6):
+    res = {}
+    for interval in intervals:
+        print(f"Running initial Granger cointegration tests for interval {interval}...")
+        results = Parallel(n_jobs=n_jobs, verbose=10)(
+            delayed(parallel_granger_coint)(pair1, pair2, interval, end_td = end_td, end_max = end_max, file_path=file_path)
+            for pair1 in fx_pairs for pair2 in fx_pairs if pair1 != pair2
+        )
+        results_df = pd.DataFrame(index=fx_pairs, columns=fx_pairs, dtype=float)
+        for (pair1, pair2), pval in results:
+            results_df.loc[pair1, pair2] = pval
+        for pair in fx_pairs:
+            results_df.loc[pair, pair] = np.nan
+        res[interval] = results_df
+    return res
