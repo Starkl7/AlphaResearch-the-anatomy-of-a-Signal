@@ -1,3 +1,4 @@
+import gc
 from joblib import Parallel, delayed
 import zipfile
 import pandas as pd
@@ -13,6 +14,8 @@ from statsmodels.tsa.seasonal import seasonal_decompose
 from statsmodels.graphics.tsaplots import plot_acf, plot_pacf
 from statsmodels.tsa.vector_ar.vecm import coint_johansen
 import trade_functions as tf
+from hurst import compute_Hc
+from itertools import combinations
 
 
 # file_path = '/Volumes/SEAGATE/FX_data/FX_histdata/'
@@ -69,34 +72,6 @@ def drop_duplicate_datetimes(df, keep='last'):
     print(f"Keeping only {keep} values for each duplicate DateTime entry")
     df.drop_duplicates(subset=['DateTime'], keep=keep, inplace=True)
     return df
-
-# def find_best_5_year_period(df):
-#     results = defaultdict(dict)
-
-#     for curr_pair in [df_audusd, df_chfjpy, df_eurjpy, df_nzdusd, df_usdchf]:
-#         dt_series = curr_pair['datetime'].sort_values()
-#         years = dt_series.dt.year.unique()
-#         min_missing = None
-#         best_period = None
-
-#         # Slide a 5-year window over available years
-#         for start in range(years.min(), years.max() - 4 + 1):
-#             end = start + 4
-#             mask = (dt_series.dt.year >= start) & (dt_series.dt.year <= end)
-#             period_series = dt_series[mask]
-#             full_range = pd.date_range(start=period_series.min(), end=period_series.max(), freq='T')
-#             missing_minutes = full_range.difference(period_series)
-#             num_missing = len(missing_minutes)
-#             if (min_missing is None) or (num_missing < min_missing):
-#                 min_missing = num_missing
-#                 best_period = (start, end)
-
-#         results[curr_pair.name]['period'] = best_period
-#         results[curr_pair.name]['missing_minutes'] = min_missing
-
-#     # Print results
-#     for name, info in results.items():
-#         print(f"{name}: Best 5-year period {info['period'][0]}-{info['period'][1]} with {info['missing_minutes']} missing minutes")
 
 def create_interval_datasets(fx_pairs, intervals, file_path):
     for interval in intervals:
@@ -266,11 +241,15 @@ def common_duration(df1, df2, start_date=None, period_in_Timedelta=None, max_per
     if start_date is not None:
         start = pd.to_datetime(start_date)
 
+    end = None
     if period_in_Timedelta is not None:
         end = start + period_in_Timedelta
     if max_period_end is not None:
-        end = min(end, max_period_end)
-    else:
+        if end is not None:
+            end = min(end, max_period_end)
+        else:
+            end = max_period_end
+    if end is None:
         end = min(df1.index.max(), df2.index.max())
 
     interval1 = get_dynamic_freq(df1.index)
@@ -292,6 +271,49 @@ def common_duration(df1, df2, start_date=None, period_in_Timedelta=None, max_per
         'Open': 'first',
         'High': 'max',
         'Low': 'min',
+        'Close': 'last'
+    }).ffill()
+
+    df1['Return'] = df1['Close'].pct_change().fillna(0)
+    df2['Return'] = df2['Close'].pct_change().fillna(0)
+
+    df1['logReturn'] = np.log(df1['Close'] / df1['Close'].shift(1)).fillna(0)
+    df2['logReturn'] = np.log(df2['Close'] / df2['Close'].shift(1)).fillna(0)
+    return df1.loc[start:end], df2.loc[start:end]
+
+def common_duration_c(df1, df2, start_date=None, period_in_Timedelta=None, max_period_end=None):
+    df1.replace([np.inf, -np.inf], np.nan, inplace=True)
+    df2.replace([np.inf, -np.inf], np.nan, inplace=True)
+    df1 = df1.dropna()
+    df2 = df2.dropna()
+    start = max(df1.index.min(), df2.index.min())
+    if start_date is not None:
+        start = pd.to_datetime(start_date)
+
+    end = None
+    if period_in_Timedelta is not None:
+        end = start + period_in_Timedelta
+    if max_period_end is not None:
+        if end is not None:
+            end = min(end, max_period_end)
+        else:
+            end = max_period_end
+    if end is None:
+        end = min(df1.index.max(), df2.index.max())
+
+    interval1 = get_dynamic_freq(df1.index)
+    interval2 = get_dynamic_freq(df2.index)
+    if interval1 != interval2:
+        print(f"df1: {interval1}, df2: {interval2}. Downsampling to common frequency.")
+        common_freq = max(interval1, interval2, key=lambda x: pd.Timedelta(x))
+    else:
+        common_freq = interval1
+
+    # Even returns were getting forward-filled. Fixed it!
+    df1 = forward_fill_df(df1).resample(common_freq, label='right', closed='right').agg({
+        'Close': 'last'
+    }).ffill()
+    df2 = forward_fill_df(df2).resample(common_freq, label='right', closed='right').agg({
         'Close': 'last'
     }).ffill()
 
@@ -375,19 +397,17 @@ def test_half_life_mean_reversion(pair1, pair2, interval, file_path, feature='Re
         print(f"Error processing {pair1} and {pair2} at interval {interval}.\n")
         return pair1_train, pair2_train
 
-def get_baseline_hedge_ratio_and_half_life(pair1, pair2, interval, file_path, feature='Return', split_date='2012-12-31'):
+def get_baseline_hedge_ratio_and_half_life(pair1, pair2, interval, file_path, feature='Close', split_date='2012-12-31'):
     print("Loading data...")
-    pair1_full = pd.read_parquet(os.path.join(file_path, f"{pair1}/", f"{pair1}_resampled_{interval}_returns.parquet"))
-    pair2_full = pd.read_parquet(os.path.join(file_path, f"{pair2}/", f"{pair2}_resampled_{interval}_returns.parquet"))
+    pair1_full = tf.load_resampled_returns(pair1, interval, file_path)
+    pair2_full = tf.load_resampled_returns(pair2, interval, file_path)
     
     print("Aligning and preprocessing data...")
-    pair1_full_new, pair2_full_new = common_duration(pair1_full, pair2_full)
-    pair1_train, _ = get_train_test(pair1_full_new, split_date)
-    pair2_train, _ = get_train_test(pair2_full_new, split_date)
+    pair1_aligned, pair2_aligned= common_duration(pair1_full, pair2_full, start_date=None, period_in_Timedelta=None, max_period_end=pd.to_datetime(split_date))
 
     print("Processing data...")    
-    hedge_ratio = get_beta_lr(pair1_train[feature], pair2_train[feature])
-    spread = pair2_train[feature] - hedge_ratio * pair1_train[feature]
+    hedge_ratio = get_beta_lr(pair1_aligned[feature], pair2_aligned[feature])
+    spread = pair2_aligned[feature] - hedge_ratio * pair1_aligned[feature]
     
     spread_lag = spread.shift(1)
     spread_ret = spread - spread_lag
@@ -396,6 +416,50 @@ def get_baseline_hedge_ratio_and_half_life(pair1, pair2, interval, file_path, fe
     
     half_life = -np.log(2) / get_beta_lr(spread_lag, spread_ret)
     return hedge_ratio, half_life
+
+
+def get_rolling_half_life(pair1, pair2, interval, file_path, feature='Close', train_end='2012-12-31', window_years=1):
+
+    pair1_full = pd.read_parquet(os.path.join(file_path, f"{pair1}/", f"{pair1}_resampled_{interval}_returns.parquet"))
+    pair2_full = pd.read_parquet(os.path.join(file_path, f"{pair2}/", f"{pair2}_resampled_{interval}_returns.parquet"))
+
+    pair1_aligned, pair2_aligned = common_duration(pair1_full, pair2_full, start_date=None, period_in_Timedelta=pd.Timedelta(days=252*5), max_period_end=pd.to_datetime(train_end))
+    pair1_train, _ = get_train_test(pair1_aligned, train_end)
+    pair2_train, _ = get_train_test(pair2_aligned, train_end)
+
+    # First valid window end = data start + 1 year
+    window_start_min = pair1_train.index.min() + pd.DateOffset(years=window_years)
+    month_starts = pd.date_range(start=window_start_min, end=train_end, freq='MS')
+
+    records = []
+    for month_date in month_starts:
+        window_start = month_date - pd.DateOffset(years=window_years)
+
+        s1 = pair1_train.loc[window_start:month_date, feature]
+        s2 = pair2_train.loc[window_start:month_date, feature]
+
+        if len(s1) < 30 or len(s2) < 30:
+            records.append({'date': month_date, 'hedge_ratio': np.nan, 'half_life': np.nan})
+            continue
+
+        try:
+            hedge_ratio = get_beta_lr(s1, s2)
+            spread = s2 - hedge_ratio * s1
+
+            spread_lag = spread.shift(1)
+            spread_ret = spread - spread_lag
+            spread_lag = spread_lag[1:]
+            spread_ret = spread_ret[1:]
+
+            beta = get_beta_lr(spread_lag, spread_ret)
+            half_life = -np.log(2) / beta if beta < 0 else np.nan
+
+            records.append({'date': month_date, 'hedge_ratio': hedge_ratio, 'half_life': half_life})
+        except Exception:
+            records.append({'date': month_date, 'hedge_ratio': np.nan, 'half_life': np.nan})
+
+    return pd.DataFrame(records).set_index('date')
+
 
 def parallel_process_window(pair1_aligned, pair2_aligned, window_idx, window_start, window_end, autolag='AIC'):
         try:
@@ -440,86 +504,159 @@ def get_rolling_granger_pvalues(pair1, pair2, autolag='AIC', period=pd.Timedelta
     pvalue_series = pd.Series(pvalues, index=dates, name='pval')
     return pvalue_series
 
-# Johansen would be too computationally expensive. Lets work on it some other time.
-# def optimal_johansen_params(df, maxlags=10):
-#     df_diff = df.diff().dropna()
-#     model = VAR(df_diff)
-#     lag_order = model.select_order(maxlags=maxlags)
-    
-#     print("Lag order selection:")
-#     print(lag_order.summary())
-    
-#     # Use AIC (tends to select more lags) or BIC (more conservative)
-#     k_ar_diff = lag_order.aic
-    
-#     # Run Johansen with selected lag
-#     result = coint_johansen(df, det_order=0, k_ar_diff=k_ar_diff)
-    
-#     return result, k_ar_diff
-
-    # result, best_lag = optimal_johansen_params(df)
-
-# def wrap_optimal_johansen_params(pair1, pair2, interval, file_path, feature='Close', split_date='2010-12-31'):
-#     print(f"Running optimal Johansen params for {pair1} and {pair2} at interval {interval}")
-#     pair1_full = pd.read_parquet(os.path.join(file_path, f"{pair1}/", f"{pair1}_resampled_{interval}_returns.parquet"))
-#     pair2_full = pd.read_parquet(os.path.join(file_path, f"{pair2}/", f"{pair2}_resampled_{interval}_returns.parquet"))
-    
-#     pair1_full_new, pair2_full_new = common_duration(pair1_full, pair2_full)
-#     pair1_train, _ = get_train_test(pair1_full_new, split_date)
-#     pair2_train, _ = get_train_test(pair2_full_new, split_date)
-
-#     df = pd.DataFrame({
-#         f'{pair1}_{feature}': pair1_train[feature],
-#         f'{pairs}_{feature}': pair2_train[feature]
-#     }).dropna()
-
-#     result, best_lag = optimal_johansen_params(df)
-#     print(f"Optimal lag for Johansen test: {best_lag}")
-#     print("Johansen test results:")
-#     print(result.summary())
-#     return result
-# def get_rolling_johansen_values()
 def get_maxlag_coint(interval):
     maxlag_config = {
-        '1T': 200,
-        '5T': 100,
-        '10T': 100,
-        '15T': 80,
-        '30T': 60,
-        '1H': 50,
-        '3H': 40,
-        '6H': 30,
-        '1D': 20
+        '1T': 50,
+        '5T': 50,
+        '10T': 40,
+        '15T': 35,
+        '30T': 30,
+        '1H': 25,
+        '3H': 20,
+        '6H': 15,
+        '1D': 15
     }
     return maxlag_config.get(interval, 20)
 
 def parallel_granger_coint(pair1, pair2, interval, end_td, end_max, file_path):
     try:
-        pair1_full = tf.load_resampled_returns(pair1, interval, file_path)
-        pair2_full = tf.load_resampled_returns(pair2, interval, file_path)
-        pair1_aligned, pair2_aligned = common_duration(pair1_full, pair2_full, start_date=None, period_in_Timedelta=end_td, max_period_end=end_max)
-        corr_precheck = pair1_aligned['Close'].pct_change().dropna().corr(pair2_aligned['Close'].pct_change().dropna())
-        if abs(corr_precheck) < 0.1:
-            print(f"Skipping {pair1} and {pair2} at interval {interval} due to low correlation ({corr_precheck:.2f})")
-            return ((pair1, pair2), np.nan)
-        t_stat, pval, crit_vals = coint(pair1_aligned['Close'], pair2_aligned['Close'], maxlag=get_maxlag_coint(interval), autolag='AIC')
-        return ((pair1, pair2), pval)
+        print(f"Processing {pair1} and {pair2} at interval {interval}...")
+        pair1_full = pd.read_parquet(os.path.join(file_path, f"{pair1}/", f"{pair1}_resampled_{interval}_returns.parquet"), columns=['Close'])
+        pair2_full = pd.read_parquet(os.path.join(file_path, f"{pair2}/", f"{pair2}_resampled_{interval}_returns.parquet"), columns=['Close'])
+        if interval in ['1T', '5T', '10T']:
+            subsample = {
+                '1T': 10,   # every 10th row → 260k rows
+                '5T': 5,    # every 5th row → 104k rows
+                '10T': 3
+            }
+            pair1_full = pair1_full.iloc[::subsample[interval]]
+            pair2_full = pair2_full.iloc[::subsample[interval]]
+
+        pair1_aligned, pair2_aligned = common_duration_c(pair1_full, pair2_full, start_date=None, period_in_Timedelta=end_td, max_period_end=end_max)
+        # corr_precheck = pair1_aligned['Close'].pct_change().dropna().corr(pair2_aligned['Close'].pct_change().dropna())
+        # if abs(corr_precheck) < 0.1:
+        #     print(f"Skipping {pair1} and {pair2} at interval {interval} due to low correlation ({corr_precheck:.2f})")
+        #     return ((pair1, pair2), np.nan)
+        t_stat, pval, crit_vals = coint(pair1_aligned['Close'], pair2_aligned['Close'], maxlag=get_maxlag_coint(interval), autolag='BIC')
+        del pair1_full, pair2_full, pair1_aligned, pair2_aligned
+        return ((pair1, pair2), interval, pval)
     except Exception as e:
         print(f"Error processing {pair1} and {pair2} at interval {interval}: {e}")
-        return ((pair1, pair2), np.nan)
+        return ((pair1, pair2), interval, np.nan)
 
-def initial_granger_cointegration(fx_pairs, intervals, file_path, end_td=pd.Timedelta(days=252*5), end_max=pd.Timestamp('2010-12-31'), n_jobs=6):
-    res = {}
+def initial_granger_cointegration(fx_pairs, combos, file_path, end_td=pd.Timedelta(days=252*5), end_max=pd.Timestamp('2012-12-31'), n_jobs=3):
+    # res = {}
+    # for pair1, pair2, interval in combos:
+    # print(f"Running initial Granger cointegration tests for interval {interval}...")
+    # results = Parallel(n_jobs=n_jobs, verbose=11)(
+    #     delayed(parallel_granger_coint)(pair1, pair2, interval, end_td = end_td, end_max = end_max, file_path=file_path)
+    #     for pair1, pair2, interval in combos
+    # )
+    results = []
+    for pair1, pair2, interval in combos:
+        print(f"Running initial Granger cointegration test for {pair1} and {pair2} at interval {interval}...")
+        result = parallel_granger_coint(pair1, pair2, interval, end_td=end_td, end_max=end_max, file_path=file_path)
+        gc.collect()
+        if result is not None:
+            results.append(result)
+
+    results_df = pd.DataFrame(
+        [[{} for _ in fx_pairs] for _ in fx_pairs],
+        index=fx_pairs,
+        columns=fx_pairs
+    )
+    for (pair1, pair2), interval, pval in results:
+        cell_dict = results_df.at[pair1, pair2]
+        cell_dict[interval] = np.round(pval, 3)
+    
+    return results_df
+
+def compute_hurst_exponent(series):
+    H, c, data = compute_Hc(series, kind='random_walk', simplified=True)
+    return H
+
+# Hurst exponent of log(price1/price2) is the same as of log(price2/price1)
+# This is pre-filtering step, before computing Granger cointegration on combos with H < 0.5.
+def wrap_hurst(fx_pairs, intervals, file_path, feature='Close'):
+    hurst_results = {}
     for interval in intervals:
-        print(f"Running initial Granger cointegration tests for interval {interval}...")
-        results = Parallel(n_jobs=n_jobs, verbose=10)(
-            delayed(parallel_granger_coint)(pair1, pair2, interval, end_td = end_td, end_max = end_max, file_path=file_path)
-            for pair1 in fx_pairs for pair2 in fx_pairs if pair1 != pair2
-        )
-        results_df = pd.DataFrame(index=fx_pairs, columns=fx_pairs, dtype=float)
-        for (pair1, pair2), pval in results:
-            results_df.loc[pair1, pair2] = pval
-        for pair in fx_pairs:
-            results_df.loc[pair, pair] = np.nan
-        res[interval] = results_df
-    return res
+        print(f"Computing Hurst exponent for {interval} interval...")
+        interval_results = {}
+        combos = list(combinations(fx_pairs, 2))
+        for pair1, pair2 in combos:
+            # if pair1 != pair2:
+            try:
+                df1 = tf.load_resampled_returns(pair1, interval, file_path)
+                df2 = tf.load_resampled_returns(pair2, interval, file_path)
+                df1_aligned, df2_aligned = common_duration(df1, df2, start_date=None, period_in_Timedelta=pd.Timedelta(days=252*5), max_period_end=pd.Timestamp('2012-12-31'))
+                log_df1 = np.log(df1_aligned[feature])
+                log_df2 = np.log(df2_aligned[feature])
+                log_ratio = log_df1 - log_df2
+                H = compute_hurst_exponent(log_ratio)
+                interval_results[(pair1, pair2)] = H
+                print(f"{pair1}-{pair2}: H = {H:.4f}")
+            except Exception as e:
+                print(f"Error computing Hurst for {pair1} and {pair2} at interval {interval}: {e}")
+                interval_results[(pair1, pair2)] = np.nan
+        hurst_results[interval] = interval_results
+    return hurst_results
+
+def batch_process(items, batch_size):
+    for i in range(0, len(items), batch_size):
+        yield items[i:i + batch_size]
+
+def analyze_periods(pair1, pair2, periods, interval, file_path, half_life_bounds, max_period_end=pd.Timestamp('2012-12-31')):
+    results = {}
+    pair1_full = tf.load_resampled_returns(pair1, interval, file_path)
+    pair2_full = tf.load_resampled_returns(pair2, interval, file_path)
+    pair1_aligned, pair2_aligned = common_duration(pair1_full, pair2_full, start_date=None, period_in_Timedelta=None, max_period_end=max_period_end)
+
+    for period_name, (start, end) in periods.items():
+        pair1_df = pair1_aligned.loc[start:end]
+        pair2_df = pair2_aligned.loc[start:end]
+
+        if len(pair1_df) < 100:  # insufficient data
+            results[period_name] = None
+            continue
+        
+        # Use Close prices for hedge ratio calculation
+        hedge_ratio = get_beta_lr(pair1_df['Close'], pair2_df['Close'])
+        spread = pair2_df['Close'] - hedge_ratio * pair1_df['Close']
+
+        spread_lag = spread.shift(1)
+        spread_ret = spread - spread_lag
+        spread_lag = spread_lag[1:]
+        spread_ret = spread_ret[1:]
+
+        beta = get_beta_lr(spread_lag, spread_ret)
+        half_life = -np.log(2) / beta if beta < 0 else np.nan
+        
+        results[period_name] = {
+            'hedge_ratio': hedge_ratio,
+            'half_life': half_life,
+            'valid_hl': half_life_bounds[interval][0] <= half_life <= half_life_bounds[interval][1]
+        }
+    return results
+
+def classify_pair(period_results):
+    pre  = period_results.get('pre_crisis')
+    post = period_results.get('post_crisis')
+    crisis = period_results.get('crisis')
+    
+    if pre is None or post is None:
+        return 'insufficient_data'
+    
+    pre_valid  = pre['valid_hl'] if pre else False
+    post_valid = post['valid_hl'] if post else False
+    crisis_valid = crisis['valid_hl'] if crisis else False
+    
+    if pre_valid and post_valid and not crisis_valid:
+        return 'TIER_1'  # structural, temporarily broke, recovered
+    elif post_valid and not pre_valid:
+        return 'TIER_2'  # new relationship post-crisis
+    elif pre_valid and not post_valid:
+        return 'TIER_3'  # pre-crisis only, relationship may be dead
+    elif pre_valid and post_valid and crisis_valid:
+        return 'TIER_4'  # survived everything, very stable
+    else:
+        return 'REJECT'
