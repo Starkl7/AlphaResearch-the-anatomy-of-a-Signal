@@ -406,8 +406,8 @@ def get_baseline_hedge_ratio_and_half_life(pair1, pair2, interval, file_path, fe
     pair1_aligned, pair2_aligned= common_duration(pair1_full, pair2_full, start_date=None, period_in_Timedelta=None, max_period_end=pd.to_datetime(split_date))
 
     print("Processing data...")    
-    hedge_ratio = get_beta_lr(pair1_aligned[feature], pair2_aligned[feature])
-    spread = pair2_aligned[feature] - hedge_ratio * pair1_aligned[feature]
+    hedge_ratio = get_beta_lr(np.log(pair1_aligned[feature]), np.log(pair2_aligned[feature]))
+    spread = np.log(pair2_aligned[feature]) - hedge_ratio * np.log(pair1_aligned[feature])
     
     spread_lag = spread.shift(1)
     spread_ret = spread - spread_lag
@@ -418,33 +418,43 @@ def get_baseline_hedge_ratio_and_half_life(pair1, pair2, interval, file_path, fe
     return hedge_ratio, half_life
 
 
-def get_rolling_half_life(pair1, pair2, interval, file_path, feature='Close', train_end='2012-12-31', window_years=1):
+def get_rolling_half_life(pair1, pair2, interval, file_path, feature='Close', train_end=None, window_years=1, offset_months=1):
 
     pair1_full = pd.read_parquet(os.path.join(file_path, f"{pair1}/", f"{pair1}_resampled_{interval}_returns.parquet"))
     pair2_full = pd.read_parquet(os.path.join(file_path, f"{pair2}/", f"{pair2}_resampled_{interval}_returns.parquet"))
 
-    pair1_aligned, pair2_aligned = common_duration(pair1_full, pair2_full, start_date=None, period_in_Timedelta=pd.Timedelta(days=252*5), max_period_end=pd.to_datetime(train_end))
+    if train_end is not None:
+        max_period_end = pd.to_datetime(train_end)
+    else:
+        max_period_end = None
+    # Don't pass period_in_Timedelta here - we want ALL data up to max_period_end
+    # The rolling window is applied later in the month loop
+    pair1_aligned, pair2_aligned = common_duration(pair1_full, pair2_full, start_date=None, period_in_Timedelta=None, max_period_end=max_period_end)
     pair1_train, _ = get_train_test(pair1_aligned, train_end)
     pair2_train, _ = get_train_test(pair2_aligned, train_end)
 
     # First valid window end = data start + 1 year
-    window_start_min = pair1_train.index.min() + pd.DateOffset(years=window_years)
-    month_starts = pd.date_range(start=window_start_min, end=train_end, freq='MS')
+    window_start_min = pair1_train.index.min() + pd.DateOffset(months=offset_months)
+    # Use actual data end if train_end is None
+    date_range_end = train_end if train_end is not None else pair1_train.index.max()
+    month_starts = pd.date_range(start=window_start_min, end=date_range_end, freq='MS')
 
     records = []
     for month_date in month_starts:
+        # Calibration window ENDS the day before month_date to avoid look-ahead bias
+        window_end = month_date - pd.DateOffset(days=1)
         window_start = month_date - pd.DateOffset(years=window_years)
 
-        s1 = pair1_train.loc[window_start:month_date, feature]
-        s2 = pair2_train.loc[window_start:month_date, feature]
+        s1 = pair1_train.loc[window_start:window_end, feature]
+        s2 = pair2_train.loc[window_start:window_end, feature]
 
         if len(s1) < 30 or len(s2) < 30:
             records.append({'date': month_date, 'hedge_ratio': np.nan, 'half_life': np.nan})
             continue
 
         try:
-            hedge_ratio = get_beta_lr(s1, s2)
-            spread = s2 - hedge_ratio * s1
+            hedge_ratio = get_beta_lr(np.log(s1), np.log(s2))
+            spread = np.log(s2) - hedge_ratio * np.log(s1)
 
             spread_lag = spread.shift(1)
             spread_ret = spread - spread_lag
@@ -518,7 +528,7 @@ def get_maxlag_coint(interval):
     }
     return maxlag_config.get(interval, 20)
 
-def parallel_granger_coint(pair1, pair2, interval, end_td, end_max, file_path):
+def granger_coint(pair1, pair2, interval, end_td, end_max, file_path):
     try:
         print(f"Processing {pair1} and {pair2} at interval {interval}...")
         pair1_full = pd.read_parquet(os.path.join(file_path, f"{pair1}/", f"{pair1}_resampled_{interval}_returns.parquet"), columns=['Close'])
@@ -526,8 +536,8 @@ def parallel_granger_coint(pair1, pair2, interval, end_td, end_max, file_path):
         if interval in ['1T', '5T', '10T']:
             subsample = {
                 '1T': 10,   # every 10th row → 260k rows
-                '5T': 5,    # every 5th row → 104k rows
-                '10T': 3
+                '5T': 2,    # every 5th row → 104k rows
+                '10T': 1
             }
             pair1_full = pair1_full.iloc[::subsample[interval]]
             pair2_full = pair2_full.iloc[::subsample[interval]]
@@ -537,7 +547,7 @@ def parallel_granger_coint(pair1, pair2, interval, end_td, end_max, file_path):
         # if abs(corr_precheck) < 0.1:
         #     print(f"Skipping {pair1} and {pair2} at interval {interval} due to low correlation ({corr_precheck:.2f})")
         #     return ((pair1, pair2), np.nan)
-        t_stat, pval, crit_vals = coint(pair1_aligned['Close'], pair2_aligned['Close'], maxlag=get_maxlag_coint(interval), autolag='BIC')
+        t_stat, pval, crit_vals = coint(np.log(pair1_aligned['Close']), np.log(pair2_aligned['Close']), maxlag=get_maxlag_coint(interval), autolag='BIC')
         del pair1_full, pair2_full, pair1_aligned, pair2_aligned
         return ((pair1, pair2), interval, pval)
     except Exception as e:
@@ -555,7 +565,7 @@ def initial_granger_cointegration(fx_pairs, combos, file_path, end_td=pd.Timedel
     results = []
     for pair1, pair2, interval in combos:
         print(f"Running initial Granger cointegration test for {pair1} and {pair2} at interval {interval}...")
-        result = parallel_granger_coint(pair1, pair2, interval, end_td=end_td, end_max=end_max, file_path=file_path)
+        result = granger_coint(pair1, pair2, interval, end_td=end_td, end_max=end_max, file_path=file_path)
         gc.collect()
         if result is not None:
             results.append(result)
@@ -619,9 +629,9 @@ def analyze_periods(pair1, pair2, periods, interval, file_path, half_life_bounds
             results[period_name] = None
             continue
         
-        # Use Close prices for hedge ratio calculation
-        hedge_ratio = get_beta_lr(pair1_df['Close'], pair2_df['Close'])
-        spread = pair2_df['Close'] - hedge_ratio * pair1_df['Close']
+        # Use log(Close prices) for hedge ratio calculation
+        hedge_ratio = get_beta_lr(np.log(pair1_df['Close']), np.log(pair2_df['Close']))
+        spread = np.log(pair2_df['Close']) - hedge_ratio * np.log(pair1_df['Close'])
 
         spread_lag = spread.shift(1)
         spread_ret = spread - spread_lag
