@@ -1,10 +1,19 @@
-/.DS_Store
+# Virtual environment
 /venv
+
+# Generated outputs (large, reproducible)
+/results/
+/data/cache/
+
+# Archived / deprecated code
 /archive
-/temp
-/backtest_results
-/Practice
-/FX_data
-/__pycache__
+
+# Python cache
+**/__pycache__/
+**/*.pyc
+**/*.pyo
+.DS_Store
+
+# Claude session metadata
 /.claude
-/.gitignore
+/CLAUDE.md
